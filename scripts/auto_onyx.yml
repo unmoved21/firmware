@@ -1,35 +1,122 @@
-import sys, json, os, subprocess
+import os, json, re, hashlib, requests
+from bs4 import BeautifulSoup
+
+ONYX_PAGE = "https://xmfirmwareupdater.com/hyperos/onyx/"
+STATE_PATH = "state/onyx_last.txt"
+
+WANTED = ["China", "EEA", "Global", "Indonesia", "India", "Russia", "Taiwan"]
+
+def fetch(url):
+    r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    return r.text
+
+def cell_text(td):
+    return " ".join(td.get_text(" ", strip=True).split())
+
+def extract_first_zip_mirror(update_url: str) -> str:
+    html = fetch(update_url)
+    soup = BeautifulSoup(html, "lxml")
+
+    # önce açıkça .zip linklerini ara
+    for a in soup.select("a[href]"):
+        href = a["href"].strip()
+        if href.lower().endswith(".zip"):
+            return href
+
+    # fallback regex
+    m = re.search(r'https?://[^\s"\']+\.zip', html, re.I)
+    if m:
+        return m.group(0)
+    raise RuntimeError(f"No .zip mirror found in update page: {update_url}")
 
 def main():
-    roms = json.loads(sys.argv[1])
-    out_dir = sys.argv[2]
-    os.makedirs(out_dir, exist_ok=True)
+    last_state = ""
+    if os.path.exists(STATE_PATH):
+        last_state = open(STATE_PATH, "r", encoding="utf-8").read().strip()
 
-    for region, info in roms.items():
-        zip_url = info["zip"]
-        version = info["version"]
+    html = fetch(ONYX_PAGE)
+    soup = BeautifulSoup(html, "lxml")
 
-        print(f"[{region}] building FW from {zip_url}")
-        tmp = os.path.join(out_dir, f"tmp_{region}")
-        os.makedirs(tmp, exist_ok=True)
+    table = soup.find("table")
+    if not table:
+        raise SystemExit("No table found on onyx page.")
 
-        # -F normal firmware
-        subprocess.check_call([
-            "xiaomi_flashable_firmware_creator",
-            "-F",
-            zip_url,
-            "-o",
-            tmp
-        ])
+    rows = table.find_all("tr")
+    best = {}  # region -> (date, version, update_url)
 
-        zips = sorted([f for f in os.listdir(tmp) if f.endswith(".zip")])
-        if not zips:
-            raise SystemExit(f"{region}: output zip not found")
+    for tr in rows:
+        tds = tr.find_all("td")
+        if len(tds) < 8:
+            continue
 
-        src = os.path.join(tmp, zips[0])
-        safe_region = region.lower()
-        dst = os.path.join(out_dir, f"FW_onyx_{safe_region}_{version}.zip".replace("/", "_"))
-        os.replace(src, dst)
+        texts = [cell_text(td) for td in tds]
+
+        # Sağdan sabit alanlar:
+        # ... | ROM_TYPE | VERSION | ANDROID | SIZE | DATE | LINK
+        # LINK hücresinde <a href="...">Download</a> var.
+        link_a = tds[-1].find("a", href=True)
+        if not link_a:
+            continue
+
+        date = texts[-2]
+        size = texts[-3]
+        android = texts[-4]
+        version = texts[-5]
+        rom_type = texts[-6]  # Recovery / Fastboot
+
+        # Filtre: Stable + Recovery (Beta istemiyoruz)
+        left = " ".join(texts[:-6]).lower()
+        if "stable" not in left:
+            continue
+        if "beta" in left:
+            continue
+        if rom_type.lower() != "recovery":
+            continue
+
+        # Bölgeyi soldaki metinden bul
+        region = None
+        for w in WANTED:
+            if w.lower() in left:
+                region = w
+                break
+        if not region:
+            continue
+
+        update_url = link_a["href"].strip()
+
+        # Aynı region için en güncel tarihi tut
+        prev = best.get(region)
+        if prev is None or (date and date > prev[0]):
+            best[region] = (date, version, update_url)
+
+    if not best:
+        raise SystemExit("No stable recovery rows found on onyx page (parser mismatch).")
+
+    roms = {}
+    summary_parts = []
+
+    for region, (date, version, update_url) in best.items():
+        zip_url = extract_first_zip_mirror(update_url)
+        roms[region] = {"date": date, "version": version, "zip": zip_url, "update": update_url}
+        summary_parts.append(f"{region}: {version} ({date})")
+
+    state_raw = json.dumps(roms, sort_keys=True)
+    new_state = hashlib.sha256(state_raw.encode("utf-8")).hexdigest()
+    has_update = (new_state != last_state)
+
+    release_tag = f"onyx-{new_state[:12]}"
+    release_title = "onyx firmware set"
+    release_notes = "Auto-generated firmware set for onyx (stable recovery, multi-region)."
+
+    # GITHUB_OUTPUT için
+    print(f"has_update={'true' if has_update else 'false'}")
+    print(f"new_state={new_state}")
+    print(f"release_tag={release_tag}")
+    print(f"release_title={release_title}")
+    print(f"release_notes={release_notes}")
+    print("roms_json=" + json.dumps(roms))
+    print("summary=" + " | ".join(summary_parts))
 
 if __name__ == "__main__":
     main()
