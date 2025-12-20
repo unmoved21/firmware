@@ -1,33 +1,36 @@
 import os, json, re, hashlib, requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
+BASE = "https://xmfirmwareupdater.com"
 ONYX_PAGE = "https://xmfirmwareupdater.com/hyperos/onyx/"
 STATE_PATH = "state/onyx_last.txt"
 
-# Biz sadece bu bölgeleri istiyoruz (sayfada varsa alır)
 WANTED = ["China", "EEA", "Global", "Indonesia", "India", "Russia", "Taiwan"]
-
-def get_text(el):
-    return " ".join(el.get_text(" ", strip=True).split())
 
 def fetch(url):
     r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     return r.text
 
+def clean(s: str) -> str:
+    return " ".join((s or "").split())
+
 def extract_first_zip_mirror(update_url: str) -> str:
     html = fetch(update_url)
-    # Sayfada genelde birden çok mirror var; direkt .zip linkini yakala
-    # bs4 ile tüm <a href> çekiyoruz
     soup = BeautifulSoup(html, "lxml")
+
+    # 1) .zip linklerini direkt yakala
     for a in soup.select("a[href]"):
         href = a["href"].strip()
-        if href.lower().endswith(".zip") and ("ota" in href.lower() or "full" in href.lower()):
+        if href.lower().endswith(".zip"):
             return href
-    # fallback: regex
+
+    # 2) fallback regex
     m = re.search(r'https?://[^\s"\']+\.zip', html, re.I)
     if m:
         return m.group(0)
+
     raise RuntimeError(f"No .zip mirror found in update page: {update_url}")
 
 def main():
@@ -38,49 +41,52 @@ def main():
     html = fetch(ONYX_PAGE)
     soup = BeautifulSoup(html, "lxml")
 
-    # tablo satırları
-    rows = soup.select("table tbody tr")
-    if not rows:
-        # bazı temalarda table direkt tr olabilir
-        rows = soup.select("tr")
+    table = soup.find("table")
+    if not table:
+        raise SystemExit("No table found on onyx page.")
 
-    # region -> (date, version, update_page_url)
-    best = {}
+    best = {}  # region -> (date, version, update_url)
 
-    for tr in rows:
-        tds = tr.find_all(["td", "th"])
-        if len(tds) < 8:
+    for tr in table.find_all("tr"):
+        # td + th birlikte
+        cells = tr.find_all(["td", "th"])
+        if len(cells) < 8:
             continue
 
-        device = get_text(tds[0])
-        branch = get_text(tds[1])
-        rom_type = get_text(tds[2])  # Fastboot / Recovery
-        version = get_text(tds[3])
-        date = get_text(tds[6])
-        link_el = tds[7].find("a", href=True)
-        if not link_el:
+        texts = [clean(c.get_text(" ", strip=True)) for c in cells[:8]]
+
+        device = texts[0]
+        branch = texts[1]      # Stable / Stable Beta
+        rom_type = texts[2]    # Fastboot / Recovery
+        version = texts[3]     # OSx.x.x.x...
+        date = texts[6]
+
+        a = cells[7].find("a", href=True)
+        if not a:
             continue
 
-        if branch.lower() != "stable":
+        # Sadece Stable + Recovery
+        if "stable" not in branch.lower():
+            continue
+        if "beta" in branch.lower():
             continue
         if rom_type.lower() != "recovery":
             continue
-        if "onyx" not in (device.lower() + " " + version.lower()):
-            continue
 
-        # region adı: Device kolonundan çek (China/EEA/Global/...)
+        # Region tespiti: device isminden
         region = None
+        dlow = device.lower()
         for w in WANTED:
-            if w.lower() in device.lower():
+            if w.lower() in dlow:
                 region = w
                 break
         if not region:
             continue
 
-        update_url = link_el["href"]
-        # aynı region için en yeni date’yi seç
+        update_url = urljoin(BASE, a["href"].strip())
+
         prev = best.get(region)
-        if (prev is None) or (date and date > prev[0]):
+        if prev is None or (date and date > prev[0]):
             best[region] = (date, version, update_url)
 
     if not best:
@@ -89,13 +95,11 @@ def main():
     roms = {}
     summary_parts = []
 
-    # Her region için direct zip çıkar
     for region, (date, version, update_url) in best.items():
         zip_url = extract_first_zip_mirror(update_url)
         roms[region] = {"date": date, "version": version, "zip": zip_url, "update": update_url}
         summary_parts.append(f"{region}: {version} ({date})")
 
-    # state hash: rom zip linkleri + versiyonlar
     state_raw = json.dumps(roms, sort_keys=True)
     new_state = hashlib.sha256(state_raw.encode("utf-8")).hexdigest()
     has_update = (new_state != last_state)
@@ -104,7 +108,7 @@ def main():
     release_title = "onyx firmware set"
     release_notes = "Auto-generated firmware set for onyx (stable recovery, multi-region)."
 
-    # GitHub output (GITHUB_OUTPUT’e yazılıyor)
+    # GitHub Actions outputs (GITHUB_OUTPUT’e append ediliyor)
     print(f"has_update={'true' if has_update else 'false'}")
     print(f"new_state={new_state}")
     print(f"release_tag={release_tag}")
