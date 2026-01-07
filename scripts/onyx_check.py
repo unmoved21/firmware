@@ -2,13 +2,23 @@ import os, json, re, hashlib, requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
-BASE = "https://xmfirmwareupdater.com"
-ONYX_PAGE = "https://xmfirmwareupdater.com/hyperos/onyx/"
+BASE = "https://mifirm.net"
+ONYX_PAGE = "https://mifirm.net/model/onyx.ttt"
 STATE_PATH = "state/onyx_last.txt"
 
-WANTED = ["China", "EEA", "Global", "Indonesia", "India", "Russia", "Taiwan"]
+# MiFirm tarafındaki etiketler -> bizim sabit region isimlerimiz
+REGION_MAP = {
+    "China": "China",
+    "Global": "Global",
+    "EEA": "EEA",
+    "Taiwan": "Taiwan",
+    "Indo": "Indonesia",
+    "Indian": "India",
+    "Russian": "Russia",
+}
+MIFIRM_REGIONS = list(REGION_MAP.keys())
 
-def fetch(url):
+def fetch(url: str) -> str:
     r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     return r.text
@@ -16,22 +26,24 @@ def fetch(url):
 def clean(s: str) -> str:
     return " ".join((s or "").split())
 
-def extract_first_zip_mirror(update_url: str) -> str:
-    html = fetch(update_url)
-    soup = BeautifulSoup(html, "lxml")
+def extract_direct_zip(download_page_url: str) -> str:
+    """
+    MiFirm /downloadzip/<id> sayfasından direkt .zip URL'sini yakala.
+    (HTML içinde link ya da script içinde URL olarak geçebiliyor -> soup + regex)
+    """
+    html = fetch(download_page_url)
 
-    # 1) .zip linklerini direkt yakala
+    soup = BeautifulSoup(html, "lxml")
     for a in soup.select("a[href]"):
         href = a["href"].strip()
         if href.lower().endswith(".zip"):
-            return href
+            return href if href.startswith("http") else urljoin(BASE, href)
 
-    # 2) fallback regex
     m = re.search(r'https?://[^\s"\']+\.zip', html, re.I)
     if m:
         return m.group(0)
 
-    raise RuntimeError(f"No .zip mirror found in update page: {update_url}")
+    raise RuntimeError(f"No direct .zip link found in: {download_page_url}")
 
 def main():
     last_state = ""
@@ -41,64 +53,66 @@ def main():
     html = fetch(ONYX_PAGE)
     soup = BeautifulSoup(html, "lxml")
 
-    table = soup.find("table")
-    if not table:
-        raise SystemExit("No table found on onyx page.")
+    # MiFirm sayfasında başlıklar şu formatta:
+    # "#### Redmi Turbo 4 Pro ZIP Stable <Region>"
+    # Biz sadece "ZIP Stable" başlıklarını alacağız.
+    best = {}  # mifirm_region -> (updated_at, version, download_page_url)
 
-    best = {}  # region -> (date, version, update_url)
+    for h in soup.find_all(["h1", "h2", "h3", "h4", "h5"]):
+        title = clean(h.get_text(" ", strip=True))
+        tlow = title.lower()
 
-    for tr in table.find_all("tr"):
-        # td + th birlikte
-        cells = tr.find_all(["td", "th"])
-        if len(cells) < 8:
+        if "zip stable" not in tlow:
             continue
 
-        texts = [clean(c.get_text(" ", strip=True)) for c in cells[:8]]
-
-        device = texts[0]
-        branch = texts[1]      # Stable / Stable Beta
-        rom_type = texts[2]    # Fastboot / Recovery
-        version = texts[3]     # OSx.x.x.x...
-        date = texts[6]
-
-        a = cells[7].find("a", href=True)
-        if not a:
-            continue
-
-        # Sadece Stable + Recovery
-        if "stable" not in branch.lower():
-            continue
-        if "beta" in branch.lower():
-            continue
-        if rom_type.lower() != "recovery":
-            continue
-
-        # Region tespiti: device isminden
-        region = None
-        dlow = device.lower()
-        for w in WANTED:
-            if w.lower() in dlow:
-                region = w
+        mifirm_region = None
+        for r in MIFIRM_REGIONS:
+            if r.lower() in tlow:
+                mifirm_region = r
                 break
-        if not region:
+        if not mifirm_region:
             continue
 
-        update_url = urljoin(BASE, a["href"].strip())
+        table = h.find_next("table")
+        if not table:
+            continue
 
-        prev = best.get(region)
-        if prev is None or (date and date > prev[0]):
-            best[region] = (date, version, update_url)
+        # Satırlar: MIUI version | Android version | File size | Update at | Downloaded | Download
+        for tr in table.find_all("tr"):
+            tds = tr.find_all("td")
+            if len(tds) < 6:
+                continue
+
+            version = clean(tds[0].get_text(" ", strip=True))
+            updated_at = clean(tds[3].get_text(" ", strip=True))  # "YYYY-MM-DD HH:MM:SS"
+            a = tds[-1].find("a", href=True)
+            if not a:
+                continue
+
+            download_page_url = urljoin(BASE, a["href"].strip())
+
+            prev = best.get(mifirm_region)
+            # Bu timestamp formatı string compare ile doğru sıralanıyor
+            if prev is None or (updated_at and updated_at > prev[0]):
+                best[mifirm_region] = (updated_at, version, download_page_url)
 
     if not best:
-        raise SystemExit("No stable recovery rows found on onyx page.")
+        raise SystemExit("No ZIP Stable rows found on MiFirm onyx page (layout may have changed).")
 
+    # Normalize edilmiş region isimleriyle roms_json üret
     roms = {}
     summary_parts = []
 
-    for region, (date, version, update_url) in best.items():
-        zip_url = extract_first_zip_mirror(update_url)
-        roms[region] = {"date": date, "version": version, "zip": zip_url, "update": update_url}
-        summary_parts.append(f"{region}: {version} ({date})")
+    for mifirm_region, (updated_at, version, download_page_url) in best.items():
+        region = REGION_MAP[mifirm_region]
+        zip_url = extract_direct_zip(download_page_url)
+        roms[region] = {
+            "date": updated_at,
+            "version": version,
+            "zip": zip_url,
+            "update": download_page_url,
+        }
+        summary_parts.append(f"{region}: {version} ({updated_at})")
 
     state_raw = json.dumps(roms, sort_keys=True)
     new_state = hashlib.sha256(state_raw.encode("utf-8")).hexdigest()
@@ -106,9 +120,8 @@ def main():
 
     release_tag = f"onyx-{new_state[:12]}"
     release_title = "onyx firmware set"
-    release_notes = "Auto-generated firmware set for onyx (stable recovery, multi-region)."
+    release_notes = "Auto-generated firmware set for onyx (ZIP stable, multi-region) from MiFirm."
 
-    # GitHub Actions outputs (GITHUB_OUTPUT’e append ediliyor)
     print(f"has_update={'true' if has_update else 'false'}")
     print(f"new_state={new_state}")
     print(f"release_tag={release_tag}")
