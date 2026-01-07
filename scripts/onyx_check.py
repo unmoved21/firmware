@@ -6,7 +6,7 @@ BASE = "https://mifirm.net"
 ONYX_PAGE = "https://mifirm.net/model/onyx.ttt"
 STATE_PATH = "state/onyx_last.txt"
 
-# MiFirm tarafındaki etiketler -> bizim sabit region isimlerimiz
+# MiFirm tarafındaki region isimleri -> bizim sabit isimlerimiz
 REGION_MAP = {
     "China": "China",
     "Global": "Global",
@@ -18,32 +18,85 @@ REGION_MAP = {
 }
 MIFIRM_REGIONS = list(REGION_MAP.keys())
 
+UA = {"User-Agent": "Mozilla/5.0"}
+
 def fetch(url: str) -> str:
-    r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+    r = requests.get(url, timeout=60, headers=UA)
     r.raise_for_status()
     return r.text
 
 def clean(s: str) -> str:
     return " ".join((s or "").split())
 
+def parse_value_after_label(lines: list[str], label: str) -> str | None:
+    """
+    'MIUI version' veya 'File name' gibi label satırından sonra gelen ilk dolu değeri döndürür.
+    """
+    for i, line in enumerate(lines):
+        if line == label:
+            for j in range(i + 1, min(i + 8, len(lines))):
+                if lines[j]:
+                    return lines[j]
+            return None
+    return None
+
 def extract_direct_zip(download_page_url: str) -> str:
     """
-    MiFirm /downloadzip/<id> sayfasından direkt .zip URL'sini yakala.
-    (HTML içinde link ya da script içinde URL olarak geçebiliyor -> soup + regex)
+    MiFirm /downloadzip/<id> sayfasında .zip linkleri genelde JS ile tıklamayla üretiliyor.
+    Bu yüzden:
+      1) Sayfada direkt .zip link varsa al
+      2) Yoksa sayfadaki 'MIUI version' + 'File name' alanlarından resmî Xiaomi OTA URL üret:
+         - bigota.d.miui.com / hugeota.d.miui.com
     """
     html = fetch(download_page_url)
-
     soup = BeautifulSoup(html, "lxml")
+
+    # 1) Direkt .zip link var mı?
     for a in soup.select("a[href]"):
-        href = a["href"].strip()
+        href = (a.get("href") or "").strip()
         if href.lower().endswith(".zip"):
             return href if href.startswith("http") else urljoin(BASE, href)
 
+    # 1b) HTML içinde direkt .zip URL geçiyor mu? (nadir)
     m = re.search(r'https?://[^\s"\']+\.zip', html, re.I)
     if m:
         return m.group(0)
 
-    raise RuntimeError(f"No direct .zip link found in: {download_page_url}")
+    # 2) MIUI version + File name parse et
+    text = soup.get_text("\n", strip=True)
+    lines = [clean(x) for x in text.splitlines() if clean(x)]
+
+    version = parse_value_after_label(lines, "MIUI version")
+    filename = parse_value_after_label(lines, "File name")
+
+    if not version or not filename:
+        raise RuntimeError(
+            f"MiFirm page parsed but MIUI version / File name not found: {download_page_url}"
+        )
+
+    # Resmî OTA adayları
+    candidates = [
+        f"https://bigota.d.miui.com/{version}/{filename}",
+        f"https://hugeota.d.miui.com/{version}/{filename}",
+    ]
+
+    # Bazı ortamlarda HEAD 403 dönebiliyor, o yüzden küçük Range GET ile kontrol daha sağlam
+    for url in candidates:
+        try:
+            r = requests.get(
+                url,
+                timeout=30,
+                headers={**UA, "Range": "bytes=0-0"},
+                allow_redirects=True,
+                stream=True,
+            )
+            if r.status_code in (200, 206):
+                return url
+        except requests.RequestException:
+            pass
+
+    # Kontrol başarısız olsa bile çoğu zaman bigota çalışır; build aşamasında denensin diye döndürüyoruz
+    return candidates[0]
 
 def main():
     last_state = ""
@@ -53,15 +106,12 @@ def main():
     html = fetch(ONYX_PAGE)
     soup = BeautifulSoup(html, "lxml")
 
-    # MiFirm sayfasında başlıklar şu formatta:
-    # "#### Redmi Turbo 4 Pro ZIP Stable <Region>"
-    # Biz sadece "ZIP Stable" başlıklarını alacağız.
+    # "ZIP Stable" başlıklarını gez
     best = {}  # mifirm_region -> (updated_at, version, download_page_url)
 
     for h in soup.find_all(["h1", "h2", "h3", "h4", "h5"]):
         title = clean(h.get_text(" ", strip=True))
         tlow = title.lower()
-
         if "zip stable" not in tlow:
             continue
 
@@ -84,7 +134,7 @@ def main():
                 continue
 
             version = clean(tds[0].get_text(" ", strip=True))
-            updated_at = clean(tds[3].get_text(" ", strip=True))  # "YYYY-MM-DD HH:MM:SS"
+            updated_at = clean(tds[3].get_text(" ", strip=True))
             a = tds[-1].find("a", href=True)
             if not a:
                 continue
@@ -92,7 +142,7 @@ def main():
             download_page_url = urljoin(BASE, a["href"].strip())
 
             prev = best.get(mifirm_region)
-            # Bu timestamp formatı string compare ile doğru sıralanıyor
+            # MiFirm "Update at" genelde "YYYY-MM-DD HH:MM:SS" → string compare ile doğru sıralanır
             if prev is None or (updated_at and updated_at > prev[0]):
                 best[mifirm_region] = (updated_at, version, download_page_url)
 
@@ -106,6 +156,7 @@ def main():
     for mifirm_region, (updated_at, version, download_page_url) in best.items():
         region = REGION_MAP[mifirm_region]
         zip_url = extract_direct_zip(download_page_url)
+
         roms[region] = {
             "date": updated_at,
             "version": version,
