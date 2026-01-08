@@ -16,26 +16,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-        - name: Free disk space
-  run: |
-    echo "Before cleanup:"
-    df -h
+      - name: Free disk space
+        run: |
+          set -e
+          echo "Before cleanup:"
+          df -h
 
-    sudo rm -rf /usr/share/dotnet
-    sudo rm -rf /usr/local/lib/android
-    sudo rm -rf /opt/ghc
-    sudo rm -rf /usr/local/share/boost
-    sudo rm -rf /usr/local/share/powershell
-    sudo rm -rf /usr/lib/jvm
-    sudo apt-get clean
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/lib/jvm
+          sudo apt-get clean
 
-    echo "After cleanup:"
-    df -h
+          echo "After cleanup:"
+          df -h
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install deps
         run: |
@@ -64,11 +66,14 @@ jobs:
           mkdir -p out
           python scripts/onyx_build_all.py "$ROMS_JSON" out
           ls -lah out
+          echo "Disk after build:"
+          df -h
 
       - name: Create release & upload assets
         if: steps.check.outputs.has_update == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.check.outputs.release_tag }}
           TITLE: ${{ steps.check.outputs.release_title }}
           NOTES: ${{ steps.check.outputs.release_notes }}
