@@ -6,7 +6,7 @@ BASE = "https://mifirm.net"
 ONYX_PAGE = "https://mifirm.net/model/onyx.ttt"
 STATE_PATH = "state/onyx_last.txt"
 
-# MiFirm tarafındaki region isimleri -> bizim sabit isimlerimiz
+# MiFirm region etiketleri -> normalize
 REGION_MAP = {
     "China": "China",
     "Global": "Global",
@@ -37,69 +37,48 @@ def parse_value_after_label(lines: list[str], label: str) -> str | None:
             return None
     return None
 
-def _url_alive(url: str) -> bool:
-    """
-    GitHub Actions/Cloudflare gibi ortamlarda HEAD bazen 403 veriyor.
-    Bu yüzden küçük Range GET ile kontrol ediyoruz.
-    """
+def url_alive(url: str) -> bool:
     try:
-        r = requests.get(
-            url,
-            timeout=30,
-            headers={**UA, "Range": "bytes=0-0"},
-            allow_redirects=True,
-            stream=True,
-        )
+        r = requests.get(url, timeout=25, headers={**UA, "Range": "bytes=0-0"}, stream=True, allow_redirects=True)
         return r.status_code in (200, 206)
-    except requests.RequestException:
+    except:
         return False
 
 def extract_direct_zip(download_page_url: str) -> str:
-    """
-    MiFirm /downloadzip/<id> sayfasındaki gerçek linkler çoğu zaman JS ile üretiliyor.
-    Bu yüzden:
-      1) HTML içinde direkt .zip link varsa al
-      2) Yoksa 'MIUI version' + 'File name' parse et
-      3) bn.d.miui.com öncelikli URL üret (fallback: bigota/hugeota)
-    """
     html = fetch(download_page_url)
     soup = BeautifulSoup(html, "lxml")
 
-    # 1) Direkt .zip link var mı?
+    # Direkt .zip link var mı?
     for a in soup.select("a[href]"):
         href = (a.get("href") or "").strip()
         if href.lower().endswith(".zip"):
             return href if href.startswith("http") else urljoin(BASE, href)
 
-    # 1b) HTML içinde direkt .zip URL var mı?
+    # HTML içinde zip geçiyor mu?
     m = re.search(r'https?://[^\s"\']+\.zip', html, re.I)
     if m:
         return m.group(0)
 
-    # 2) MIUI version + File name parse et
+    # MIUI version + File name parse
     text = soup.get_text("\n", strip=True)
     lines = [clean(x) for x in text.splitlines() if clean(x)]
 
     version = parse_value_after_label(lines, "MIUI version")
     filename = parse_value_after_label(lines, "File name")
-
     if not version or not filename:
-        raise RuntimeError(
-            f"MiFirm page parsed but MIUI version / File name not found: {download_page_url}"
-        )
+        raise RuntimeError(f"Cannot find MIUI version or File name in {download_page_url}")
 
-    # 3) bn.d.miui.com öncelikli + fallback
+    # bn.d.miui.com öncelikli + fallback
     candidates = [
         f"https://bn.d.miui.com/{version}/{filename}",
         f"https://bigota.d.miui.com/{version}/{filename}",
         f"https://hugeota.d.miui.com/{version}/{filename}",
     ]
+    for u in candidates:
+        if url_alive(u):
+            return u
 
-    for url in candidates:
-        if _url_alive(url):
-            return url
-
-    # Hiçbiri doğrulanamazsa yine bn döndür (çoğu durumda çalışır)
+    # hiç olmazsa bn döndür
     return candidates[0]
 
 def main():
@@ -110,28 +89,26 @@ def main():
     html = fetch(ONYX_PAGE)
     soup = BeautifulSoup(html, "lxml")
 
-    # "ZIP Stable" başlıklarını gez
-    best = {}  # mifirm_region -> (updated_at, version, download_page_url)
+    best = {}
 
-    for h in soup.find_all(["h1", "h2", "h3", "h4", "h5"]):
+    for h in soup.find_all(["h1","h2","h3","h4","h5"]):
         title = clean(h.get_text(" ", strip=True))
-        tlow = title.lower()
-        if "zip stable" not in tlow:
+        if "zip stable" not in title.lower():
             continue
 
-        mifirm_region = None
+        region_tag = None
+        tlow = title.lower()
         for r in MIFIRM_REGIONS:
             if r.lower() in tlow:
-                mifirm_region = r
+                region_tag = r
                 break
-        if not mifirm_region:
+        if not region_tag:
             continue
 
         table = h.find_next("table")
         if not table:
             continue
 
-        # Satırlar: MIUI version | Android version | File size | Update at | Downloaded | Download
         for tr in table.find_all("tr"):
             tds = tr.find_all("td")
             if len(tds) < 6:
@@ -145,15 +122,13 @@ def main():
 
             download_page_url = urljoin(BASE, a["href"].strip())
 
-            prev = best.get(mifirm_region)
-            # "YYYY-MM-DD HH:MM:SS" -> string compare ile doğru çalışır
+            prev = best.get(region_tag)
             if prev is None or (updated_at and updated_at > prev[0]):
-                best[mifirm_region] = (updated_at, version, download_page_url)
+                best[region_tag] = (updated_at, version, download_page_url)
 
     if not best:
-        raise SystemExit("No ZIP Stable rows found on MiFirm onyx page (layout may have changed).")
+        raise SystemExit("No ZIP Stable found on MiFirm")
 
-    # Normalize edilmiş region isimleriyle roms_json üret
     roms = {}
     summary_parts = []
 
@@ -173,15 +148,11 @@ def main():
     new_state = hashlib.sha256(state_raw.encode("utf-8")).hexdigest()
     has_update = (new_state != last_state)
 
-    release_tag = f"onyx-{new_state[:12]}"
-    release_title = "onyx firmware set"
-    release_notes = "Auto-generated firmware set for onyx (ZIP stable, multi-region) using MiFirm metadata + bn.d.miui.com downloads."
-
     print(f"has_update={'true' if has_update else 'false'}")
     print(f"new_state={new_state}")
-    print(f"release_tag={release_tag}")
-    print(f"release_title={release_title}")
-    print(f"release_notes={release_notes}")
+    print(f"release_tag=onyx-{new_state[:12]}")
+    print(f"release_title=onyx firmware set")
+    print(f"release_notes=Auto firmware set from MiFirm + bn.d.miui.com")
     print("roms_json=" + json.dumps(roms))
     print("summary=" + " | ".join(summary_parts))
 
