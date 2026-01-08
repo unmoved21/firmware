@@ -29,24 +29,38 @@ def clean(s: str) -> str:
     return " ".join((s or "").split())
 
 def parse_value_after_label(lines: list[str], label: str) -> str | None:
-    """
-    'MIUI version' veya 'File name' gibi label satırından sonra gelen ilk dolu değeri döndürür.
-    """
     for i, line in enumerate(lines):
         if line == label:
-            for j in range(i + 1, min(i + 8, len(lines))):
+            for j in range(i + 1, min(i + 10, len(lines))):
                 if lines[j]:
                     return lines[j]
             return None
     return None
 
+def _url_alive(url: str) -> bool:
+    """
+    GitHub Actions/Cloudflare gibi ortamlarda HEAD bazen 403 veriyor.
+    Bu yüzden küçük Range GET ile kontrol ediyoruz.
+    """
+    try:
+        r = requests.get(
+            url,
+            timeout=30,
+            headers={**UA, "Range": "bytes=0-0"},
+            allow_redirects=True,
+            stream=True,
+        )
+        return r.status_code in (200, 206)
+    except requests.RequestException:
+        return False
+
 def extract_direct_zip(download_page_url: str) -> str:
     """
-    MiFirm /downloadzip/<id> sayfasında .zip linkleri genelde JS ile tıklamayla üretiliyor.
+    MiFirm /downloadzip/<id> sayfasındaki gerçek linkler çoğu zaman JS ile üretiliyor.
     Bu yüzden:
-      1) Sayfada direkt .zip link varsa al
-      2) Yoksa sayfadaki 'MIUI version' + 'File name' alanlarından resmî Xiaomi OTA URL üret:
-         - bigota.d.miui.com / hugeota.d.miui.com
+      1) HTML içinde direkt .zip link varsa al
+      2) Yoksa 'MIUI version' + 'File name' parse et
+      3) bn.d.miui.com öncelikli URL üret (fallback: bigota/hugeota)
     """
     html = fetch(download_page_url)
     soup = BeautifulSoup(html, "lxml")
@@ -57,7 +71,7 @@ def extract_direct_zip(download_page_url: str) -> str:
         if href.lower().endswith(".zip"):
             return href if href.startswith("http") else urljoin(BASE, href)
 
-    # 1b) HTML içinde direkt .zip URL geçiyor mu? (nadir)
+    # 1b) HTML içinde direkt .zip URL var mı?
     m = re.search(r'https?://[^\s"\']+\.zip', html, re.I)
     if m:
         return m.group(0)
@@ -74,28 +88,18 @@ def extract_direct_zip(download_page_url: str) -> str:
             f"MiFirm page parsed but MIUI version / File name not found: {download_page_url}"
         )
 
-    # Resmî OTA adayları
+    # 3) bn.d.miui.com öncelikli + fallback
     candidates = [
+        f"https://bn.d.miui.com/{version}/{filename}",
         f"https://bigota.d.miui.com/{version}/{filename}",
         f"https://hugeota.d.miui.com/{version}/{filename}",
     ]
 
-    # Bazı ortamlarda HEAD 403 dönebiliyor, o yüzden küçük Range GET ile kontrol daha sağlam
     for url in candidates:
-        try:
-            r = requests.get(
-                url,
-                timeout=30,
-                headers={**UA, "Range": "bytes=0-0"},
-                allow_redirects=True,
-                stream=True,
-            )
-            if r.status_code in (200, 206):
-                return url
-        except requests.RequestException:
-            pass
+        if _url_alive(url):
+            return url
 
-    # Kontrol başarısız olsa bile çoğu zaman bigota çalışır; build aşamasında denensin diye döndürüyoruz
+    # Hiçbiri doğrulanamazsa yine bn döndür (çoğu durumda çalışır)
     return candidates[0]
 
 def main():
@@ -142,7 +146,7 @@ def main():
             download_page_url = urljoin(BASE, a["href"].strip())
 
             prev = best.get(mifirm_region)
-            # MiFirm "Update at" genelde "YYYY-MM-DD HH:MM:SS" → string compare ile doğru sıralanır
+            # "YYYY-MM-DD HH:MM:SS" -> string compare ile doğru çalışır
             if prev is None or (updated_at and updated_at > prev[0]):
                 best[mifirm_region] = (updated_at, version, download_page_url)
 
@@ -171,7 +175,7 @@ def main():
 
     release_tag = f"onyx-{new_state[:12]}"
     release_title = "onyx firmware set"
-    release_notes = "Auto-generated firmware set for onyx (ZIP stable, multi-region) from MiFirm."
+    release_notes = "Auto-generated firmware set for onyx (ZIP stable, multi-region) using MiFirm metadata + bn.d.miui.com downloads."
 
     print(f"has_update={'true' if has_update else 'false'}")
     print(f"new_state={new_state}")
