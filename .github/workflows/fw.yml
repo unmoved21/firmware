@@ -2,7 +2,7 @@ name: Auto FW (onyx from xmfirmwareupdater page)
 
 on:
   schedule:
-    - cron: "30 6 * * *" # her gün 06:30 UTC
+    - cron: "30 6 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -90,7 +90,7 @@ jobs:
           SUMMARY: ${{ steps.check.outputs.summary }}
         run: |
           set -e
-          TEXT="✅ onyx FW seti hazir!%0A%0A${SUMMARY}%0A%0AIndirme (tek release):%0A${RELEASE_URL}"
+          TEXT=" onyx FW seti hazir!%0A%0A${SUMMARY}%0A%0AIndirme (tek release):%0A${RELEASE_URL}"
           curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_CHAT_ID}" \
             -d "text=${TEXT}" \
