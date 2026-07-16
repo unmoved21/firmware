@@ -75,26 +75,66 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.check.outputs.release_tag }}
           TITLE: ${{ steps.check.outputs.release_title }}
-          NOTES: ${{ steps.check.outputs.release_notes }}
+          NOTES_CONTENT: ${{ steps.check.outputs.release_notes }}
         run: |
           set -e
-          gh release create "$TAG" out/*.zip --title "$TITLE" --notes "$NOTES"
+          # Delete previous release and tag if they exist
+          gh release delete "$TAG" --yes || true
+          git push --delete origin "$TAG" || true
+
+          # Create fresh release
+          gh release create "$TAG" out/*.zip --title "$TITLE" --notes "$NOTES_CONTENT"
           echo "release_url=$(gh release view "$TAG" --json url -q .url)" >> "$GITHUB_OUTPUT"
 
-      - name: Telegram notify (single message)
+      - name: Telegram notify
         if: steps.check.outputs.has_update == 'true'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          RELEASE_URL: ${{ steps.check.outputs.release_url }}
-          SUMMARY: ${{ steps.check.outputs.summary }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.check.outputs.release_tag }}
         run: |
           set -e
-          TEXT=" onyx FW seti hazir!%0A%0A${SUMMARY}%0A%0AIndirme (tek release):%0A${RELEASE_URL}"
-          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TELEGRAM_CHAT_ID}" \
-            -d "text=${TEXT}" \
-            -d "disable_web_page_preview=false"
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import requests
+          rel=json.loads(subprocess.check_output(["gh","release","view",os.environ["TAG"],"--json","url,assets"],text=True))
+          regions=[("china","🇨🇳 China"),("eea","🇪🇺 EEA"),("global","🌍 Global"),("india","🇮🇳 India"),("indonesia","🇮🇩 Indonesia"),("russia","🇷🇺 Russia"),("taiwan","🇹🇼 Taiwan")]
+          rows=[]
+          
+          for key,label in regions:
+              for a in rel.get("assets", []):
+                  file_name = a.get("name", "")
+                  if file_name.lower().startswith("fw_") and key in file_name.lower():
+                      download_url = a.get("browser_download_url") or a.get("url") or rel["url"]
+                      
+                      # Strip extension and split by underscores
+                      clean_name = file_name.replace(".zip", "")
+                      parts = clean_name.split("_")
+                      
+                      # Find the segment containing the OS version (e.g., OS3.0.303.0.WOLCNXM)
+                      version_str = ""
+                      for part in parts:
+                          # Match OS... or V... versions (HyperOS / MIUI style)
+                          if part.upper().startswith("OS") or (part.upper().startswith("V") and "." in part):
+                              version_str = part
+                              break
+                      
+                      # Fallback if no matching pattern is found
+                      if not version_str:
+                          version_str = parts[-2] if len(parts) >= 2 else clean_name
+                          
+                      # Clean button text format
+                      button_text = f"{label} - {version_str}"
+                      
+                      rows.append([{"text": button_text, "url": download_url}])
+                      break
+                      
+          rows.append([{"text":"🌐 GitHub Release","url":rel["url"]}])
+          requests.post(f'https://api.telegram.org/bot{os.environ["TELEGRAM_BOT_TOKEN"]}/sendMessage',json={"chat_id":os.environ["TELEGRAM_CHAT_ID"],"parse_mode":"HTML","text":"📦 <b>New Firmware Release</b>\n\n📱 <b>POCO F7 (onyx)</b>\n\nChoose your firmware:","reply_markup":{"inline_keyboard":rows}}).raise_for_status()
+          PY
 
       - name: Save state & commit
         if: steps.check.outputs.has_update == 'true'
